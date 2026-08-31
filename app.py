@@ -35,10 +35,12 @@ IMPORTANT — one thing I could not verify from this environment:
 """
 
 import os
+import re
 import tempfile
 import shutil
 import logging
 import urllib.request
+import urllib.error
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -66,6 +68,38 @@ app.add_middleware(
 HF_SPACE = os.environ.get("HAIRFAST_SPACE", "AIRI-Institute/HairFastGAN")
 
 _client = None
+
+
+def _safe_filename(name: str) -> str:
+    """Strip any path components and unsafe characters from an
+    uploaded filename before using it to build a path on disk."""
+    name = os.path.basename(name or "photo.jpg")
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name) or "photo.jpg"
+
+
+def _download_image(url: str, dest_path: str, field_label: str) -> None:
+    """Download a reference image URL to dest_path.
+
+    Plain urllib requests get rejected (403) by several image CDNs,
+    Pexels included, because they don't send a browser-like
+    User-Agent. This sends one, and turns any failure into a clear,
+    catchable error instead of an unhandled exception that would
+    otherwise crash past all of our error handling below and reach
+    the browser as a bare, un-explained 500.
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; GoldenFadeStylePreview/1.0)"})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            content_type = response.headers.get("Content-Type", "")
+            if not content_type.startswith("image/"):
+                raise ValueError(f"URL did not return an image (got '{content_type}').")
+            with open(dest_path, "wb") as f:
+                shutil.copyfileobj(response, f)
+    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, TimeoutError) as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Couldn't download the {field_label} reference photo ({e}). The link may be broken or blocked.",
+        )
 
 
 def get_client() -> Client:
@@ -109,25 +143,27 @@ async def generate_preview(
     face_path = None
     shape_path = None
     try:
-        face_path = os.path.join(tmp_dir, "face_" + face.filename)
+        face_path = os.path.join(tmp_dir, "face_" + _safe_filename(face.filename))
         with open(face_path, "wb") as f:
             shutil.copyfileobj(face.file, f)
+        if os.path.getsize(face_path) == 0:
+            raise HTTPException(status_code=400, detail="The uploaded face photo was empty.")
 
         if shape is not None:
-            shape_path = os.path.join(tmp_dir, "shape_" + shape.filename)
+            shape_path = os.path.join(tmp_dir, "shape_" + _safe_filename(shape.filename))
             with open(shape_path, "wb") as f:
                 shutil.copyfileobj(shape.file, f)
         else:
             shape_path = os.path.join(tmp_dir, "shape_from_url.jpg")
-            urllib.request.urlretrieve(shape_url, shape_path)
+            _download_image(shape_url, shape_path, "hairstyle")
 
         if color is not None:
-            color_path = os.path.join(tmp_dir, "color_" + color.filename)
+            color_path = os.path.join(tmp_dir, "color_" + _safe_filename(color.filename))
             with open(color_path, "wb") as f:
                 shutil.copyfileobj(color.file, f)
         elif color_url:
             color_path = os.path.join(tmp_dir, "color_from_url.jpg")
-            urllib.request.urlretrieve(color_url, color_path)
+            _download_image(color_url, color_path, "hair colour")
         else:
             color_path = shape_path  # reuse the shape photo for colour too
 
